@@ -318,17 +318,31 @@ class Bag(set):
     ####### 
     # Bag interface.
     ####### 
-    def find(self, name):
-        """Find an object in the bag by name, but do not remove it.
+    def find(self, item):
+        """Find an object in the bag by name or by item, but do not remove it.
 
-        Return None if the name does not match.
+        Accepts either an item name (a str) or an Item object.
+
+        Return None if the name or item does not match anything in the bag.
         
         If more than one object with the same name exists, returns one of them.
 
         """
-        name = name.lower()
-        for element in self._alias_dict.get(name, []):
+        if isinstance(item, Item):
+            if set.__contains__(self, item):
+                return item
+            return None
+        if not isinstance(item, str):
+            raise TypeError(
+                'Bag.find() requires an item name (str) or an Item, '
+                'not %s' % type(item).__name__
+            )
+        name = item.lower()
+        # Sort candidates so the result is deterministic and does not depend
+        # on set iteration (hash) order.
+        for element in sorted(self._alias_dict.get(name, ()), key=lambda i: i.aliases):
             return element
+        return None
 
     def __contains__(self, v):
         """Return True if an Item is present in the bag.
@@ -342,15 +356,18 @@ class Bag(set):
         else:
             return super().__contains__(v)
 
-    def take(self, name):
+    def take(self, item):
         """Remove an Item from the bag if it is present.
+
+        Accepts either an item name (a str) or an Item object, such as one
+        previously returned by find().
 
         If multiple names match, then return one of them.
 
-        Return None if no item matches the name.
+        Return None if no item matches.
 
         """
-        obj = self.find(name)
+        obj = self.find(item)
         if obj is not None:
             self.remove(obj)
         return obj

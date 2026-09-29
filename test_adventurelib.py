@@ -427,3 +427,254 @@ def test_room_add_direction_is_attribute():
         match="'exit' is an existing attribute and cannot be used as direction name!",
     ):
         room.add_direction("up", "exit")
+
+
+def bag_snapshot(bag):
+    """Take a deep-copy snapshot of a Bag's observable state.
+
+    State is captured by value (item aliases) rather than identity, so the
+    snapshot survives comparison against the live bag.
+    """
+    deep_items = copy.deepcopy(list(bag))
+    return {
+        "items": sorted(i.aliases for i in deep_items),
+        "aliases": {
+            k: sorted(i.aliases for i in v) for k, v in bag._alias_dict.items()
+        },
+    }
+
+
+def assert_bag_unchanged(bag, snapshot):
+    """Assert a bag is field-for-field identical to its snapshot."""
+    assert sorted(i.aliases for i in bag) == snapshot["items"]
+    assert {
+        k: sorted(i.aliases for i in v) for k, v in bag._alias_dict.items()
+    } == snapshot["aliases"]
+
+
+def test_bag_find_by_object():
+    """find() accepts an Item object as well as a name."""
+    item = Item("sword", "blade")
+    other = Item("shield")
+    bag = Bag({item, other})
+    assert bag.find(item) is item
+    assert bag.find(other) is other
+
+
+def test_bag_find_object_not_present():
+    """find() with an Item that is not in the bag returns None."""
+    bag = Bag({Item("sword")})
+    assert bag.find(Item("sword")) is None
+
+
+def test_bag_take_found_object():
+    """Taking an object previously returned by find() works (the bug)."""
+    item = Item("rusty mallet", "mallet")
+    bag = Bag({item})
+    found = bag.find("mallet")
+    assert found is item
+    taken = bag.take(found)
+    assert taken is item
+    assert item not in bag
+    assert not bag
+
+
+@pytest.mark.parametrize("key", ["sword", "Sword", "blade"])
+def test_bag_take_by_name_still_works(key):
+    """Passing a name to take() keeps working, case insensitively."""
+    item = Item("Sword", "blade")
+    bag = Bag({item})
+    assert bag.take(key) is item
+    assert not bag
+
+
+@pytest.mark.parametrize("bad", [None, 42, 3.14, object(), ["sword"], ("sword",)])
+def test_bag_find_invalid_argument_type(bad):
+    """find() raises a readable TypeError for non-str, non-Item arguments."""
+    bag = Bag({Item("sword")})
+    snapshot = bag_snapshot(bag)
+    with pytest.raises(TypeError, match="requires an item name"):
+        bag.find(bad)
+    assert_bag_unchanged(bag, snapshot)
+
+
+@pytest.mark.parametrize("bad", [None, 42, 3.14, object(), ["sword"], ("sword",)])
+def test_bag_take_invalid_argument_type_rolls_back(bad):
+    """A rejected take() leaves the bag field-for-field unchanged."""
+    item = Item("sword", "blade")
+    bag = Bag({item, Item("shield")})
+    snapshot = bag_snapshot(bag)
+    with pytest.raises(TypeError, match="requires an item name"):
+        bag.take(bad)
+    assert_bag_unchanged(bag, snapshot)
+
+
+@pytest.mark.parametrize("method", ["find", "take"])
+def test_bag_missing_item_returns_none(method):
+    """Looking up an absent item returns None instead of raising."""
+    bag = Bag({Item("sword")})
+    snapshot = bag_snapshot(bag)
+    assert getattr(bag, method)("dragon") is None
+    assert getattr(bag, method)(Item("dragon")) is None
+    assert_bag_unchanged(bag, snapshot)
+
+
+def test_bag_take_from_empty_bag():
+    """Taking from an empty bag (insufficient resources) returns None."""
+    bag = Bag()
+    assert bag.take("anything") is None
+    assert bag.take(Item("anything")) is None
+    assert bag.find("anything") is None
+
+
+def test_bag_take_repeated_calls():
+    """Taking the same name twice: the second call finds nothing."""
+    item = Item("coin")
+    bag = Bag({item})
+    assert bag.take("coin") is item
+    assert bag.take("coin") is None
+    assert bag.take(item) is None
+    assert not bag
+
+
+def test_bag_find_repeated_calls_idempotent():
+    """find() does not mutate the bag, however often it is called."""
+    item = Item("gem", "jewel")
+    bag = Bag({item})
+    snapshot = bag_snapshot(bag)
+    for _ in range(5):
+        assert bag.find("gem") is item
+        assert bag.find(item) is item
+    assert_bag_unchanged(bag, snapshot)
+
+
+def test_bag_take_partial_completion():
+    """Taking one of several items leaves the rest fully intact."""
+    sword = Item("sword", "blade")
+    shield = Item("shield")
+    bag = Bag({sword, shield})
+    assert bag.take(sword) is sword
+    assert shield in bag
+    assert "shield" in bag
+    assert "sword" not in bag
+    assert bag.find("blade") is None
+    assert set(bag._alias_dict) == {"shield"}
+
+
+def test_bag_out_of_order_input_deterministic():
+    """The same items added in different orders give identical results."""
+    names = ["apple", "banana", "cherry", "date"]
+    results = []
+    for order in (names, names[::-1], [names[2], names[0], names[3], names[1]]):
+        bag = Bag(Item(n) for n in order)
+        outcome = [bag.find(n).name for n in names]
+        outcome += [bag.take(names[1]).name, bag.take(names[3]).name]
+        outcome.append(sorted(i.name for i in bag))
+        results.append(outcome)
+    assert results[0] == results[1] == results[2]
+
+
+def test_bag_same_input_sequence_replay():
+    """Replaying the same operation sequence gives the same outcome."""
+
+    def run():
+        bag = Bag({Item("rock"), Item("paper"), Item("scissors")})
+        log = []
+        log.append(bag.take("paper"))
+        log.append(bag.take("missing"))
+        log.append(bag.find("rock"))
+        log.append(bag.take(bag.find("scissors")))
+        log.append(bag.take("rock"))
+        log.append(bag.take("rock"))
+        return [str(x) for x in log], sorted(str(i) for i in bag)
+
+    first, first_remaining = run()
+    second, second_remaining = run()
+    assert first == second
+    assert first_remaining == second_remaining == []
+
+
+def test_bag_failed_take_then_success():
+    """A failed take does not disturb a subsequent successful take."""
+    item = Item("key")
+    bag = Bag({item})
+    assert bag.take("lock") is None
+    with pytest.raises(TypeError):
+        bag.take(None)
+    assert bag.take("key") is item
+    assert not bag
+
+
+def test_bag_alias_dict_does_not_grow_unbounded():
+    """Adding and removing many items leaves no residue in the alias dict."""
+    bag = Bag()
+    for i in range(200):
+        bag.add(Item("item %d" % i, "alias %d" % i))
+    assert len(bag._alias_dict) == 400
+    for i in range(200):
+        assert bag.take("item %d" % i) is not None
+    assert not bag
+    assert bag._alias_dict == {}
+
+
+def test_bag_single_element_boundary():
+    """A single-element bag supports find/take by name and by object."""
+    item = Item("only")
+    bag = Bag({item})
+    assert bag.find("only") is item
+    assert bag.take(item) is item
+    assert bag.take("only") is None
+
+
+def test_bag_find_ambiguous_alias_deterministic():
+    """With several items sharing an alias, find() is stable across replays."""
+
+    def run():
+        bag = Bag({Item("red gem", "gem"), Item("blue gem", "gem")})
+        return str(bag.find("gem"))
+
+    assert run() == run()
+
+
+def test_inventory_room_command_flow():
+    """The take/drop command flow stays consistent across rooms and inventory."""
+    inventory = Bag()
+    hall = Room("A hall.")
+    hall.items = Bag({Item("torch", "light")})
+    state = {"room": hall}
+
+    @when("take ITEM")
+    def take_cmd(item):
+        obj = state["room"].items.take(item)
+        if obj:
+            inventory.add(obj)
+
+    @when("drop ITEM")
+    def drop_cmd(item):
+        obj = inventory.take(item)
+        if obj:
+            state["room"].items.add(obj)
+
+    _handle_command("take torch")
+    assert "torch" in inventory
+    assert not hall.items
+
+    # Repeated take of an item no longer in the room is a no-op.
+    _handle_command("take torch")
+    assert len(inventory) == 1
+
+    _handle_command("drop torch")
+    assert not inventory
+    assert "torch" in hall.items
+
+    # Out-of-order and repeated commands over several turns stay consistent.
+    for _ in range(3):
+        _handle_command("take light")
+        _handle_command("drop torch")
+    assert "torch" in hall.items
+    assert not inventory
+
+    # Taking via a found object works through the same Bag used by commands.
+    found = hall.items.find("torch")
+    assert hall.items.take(found) is found
+    assert not hall.items
