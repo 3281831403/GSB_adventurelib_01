@@ -427,3 +427,243 @@ def test_room_add_direction_is_attribute():
         match="'exit' is an existing attribute and cannot be used as direction name!",
     ):
         room.add_direction("up", "exit")
+
+
+def make_rooms(*descriptions):
+    """Create a list of rooms with the given descriptions."""
+    return [Room(description) for description in descriptions]
+
+
+def room_state(room):
+    """Return a deterministic, comparable snapshot of a room's state."""
+    return {
+        "description": room.description,
+        "exits": room.exits(),
+        "attrs": {
+            key: value.description if isinstance(value, Room) else value
+            for key, value in sorted(vars(room).items())
+        },
+    }
+
+
+def test_room_plain_attribute_success():
+    """A Room can be stored as a plain attribute without navigation."""
+    hall, cellar = make_rooms("Hall", "Cellar")
+    hall.treasure_room = cellar
+    assert hall.treasure_room is cellar
+    assert hall.exits() == []
+    assert cellar.exits() == []
+
+
+def test_room_plain_attribute_creates_no_reverse_link():
+    """A plain attribute does not link the other room back."""
+    hall, cellar = make_rooms("Hall", "Cellar")
+    hall.key_location = cellar
+    for direction in Room._directions:
+        assert getattr(cellar, direction, None) is None
+        assert cellar.exit(direction) is None
+
+
+@pytest.mark.parametrize(
+    "forward,reverse",
+    [("north", "south"), ("east", "west")],
+)
+def test_room_direction_connection_still_bidirectional(forward, reverse):
+    """Declared directions still create two-way navigation connections."""
+    hall, cellar = make_rooms("Hall", "Cellar")
+    setattr(hall, forward, cellar)
+    assert getattr(hall, forward) is cellar
+    assert getattr(cellar, reverse) is hall
+    assert hall.exit(forward) is cellar
+    assert cellar.exit(reverse) is hall
+    assert hall.exits() == [forward]
+    assert cellar.exits() == [reverse]
+
+
+def test_room_plain_attribute_repeated_set_no_duplicates():
+    """Repeatedly setting a plain attribute is idempotent and bounded."""
+    hall, cellar, attic = make_rooms("Hall", "Cellar", "Attic")
+    for _ in range(3):
+        hall.treasure_room = cellar
+    hall.treasure_room = attic
+    assert hall.treasure_room is attic
+    assert hall.exits() == []
+    assert attic.exits() == []
+    assert cellar.exits() == []
+    assert len(vars(hall)) == 2  # description + treasure_room only
+
+
+def test_room_direction_repeated_set_no_duplicates():
+    """Repeatedly setting a direction does not create duplicate exits."""
+    hall, cellar = make_rooms("Hall", "Cellar")
+    for _ in range(5):
+        hall.north = cellar
+    assert hall.exits() == ["north"]
+    assert cellar.exits() == ["south"]
+    assert hall.north is cellar
+    assert cellar.south is hall
+
+
+def test_room_plain_attribute_overwrite_with_non_room():
+    """A plain room attribute can be replaced by a non-room value."""
+    hall, cellar = make_rooms("Hall", "Cellar")
+    hall.treasure_room = cellar
+    hall.treasure_room = None
+    assert hall.treasure_room is None
+    assert hall.exits() == []
+    assert cellar.exits() == []
+
+
+def test_room_exit_invalid_direction():
+    """exit() with an undeclared direction raises KeyError."""
+    hall = Room("Hall")
+    with pytest.raises(KeyError):
+        hall.exit("sideways")
+
+
+def test_room_exit_and_exits_empty_boundaries():
+    """A room with no connections has no exits; exit() returns None."""
+    hall = Room("Hall")
+    assert hall.exits() == []
+    for direction in Room._directions:
+        assert hall.exit(direction) is None
+
+
+def test_room_self_connection_single_element_boundary():
+    """A room connected to itself is a consistent single-element case."""
+    hall = Room("Hall")
+    hall.north = hall
+    assert hall.north is hall
+    assert hall.south is hall
+    assert hall.exits() == ["north", "south"]
+
+
+@pytest.mark.parametrize(
+    "forward,reverse",
+    [
+        ("Up", "down"),  # invalid first direction
+        ("up", "Down"),  # invalid second direction (partial completion)
+        ("up", "exit"),  # second name collides with an existing attribute
+    ],
+)
+def test_room_add_direction_failure_rolls_back(forward, reverse):
+    """A failed add_direction leaves Room state field-for-field identical."""
+    snapshot = copy.deepcopy(Room._directions)
+    names = {forward.lower(), reverse.lower()}
+    attrs_before = {
+        name: getattr(Room, name, None) for name in names if hasattr(Room, name)
+    }
+    with pytest.raises((InvalidCommand, KeyError, AttributeError)):
+        Room.add_direction(forward, reverse)
+    assert Room._directions == snapshot
+    for name in names:
+        if name in attrs_before:
+            assert getattr(Room, name) == attrs_before[name]
+        else:
+            assert not hasattr(Room, name)
+
+
+def test_room_add_direction_failure_then_success():
+    """A rejected add_direction does not affect a subsequent valid call."""
+    snapshot = copy.deepcopy(Room._directions)
+    with pytest.raises(InvalidCommand):
+        Room.add_direction("Up", "down")
+    assert Room._directions == snapshot
+    Room.add_direction("up", "down")
+    hall, cellar = make_rooms("Hall", "Cellar")
+    hall.up = cellar
+    assert cellar.down is hall
+    assert hall.exits() == ["up"]
+
+
+def test_room_attribute_order_independence():
+    """The same assignments in different orders give the same end state."""
+
+    def build(order):
+        hall, cellar, attic = make_rooms("Hall", "Cellar", "Attic")
+        steps = {
+            "link": lambda: setattr(hall, "north", cellar),
+            "plain": lambda: setattr(hall, "treasure_room", attic),
+            "desc": lambda: setattr(cellar, "note", "dark"),
+        }
+        for step in order:
+            steps[step]()
+        return [room_state(r) for r in (hall, cellar, attic)]
+
+    assert build(["link", "plain", "desc"]) == build(["desc", "plain", "link"])
+
+
+def test_room_same_input_sequence_replay_determinism():
+    """Replaying the same input sequence yields identical results."""
+
+    def play():
+        rooms = make_rooms("R1", "R2", "R3")
+        rooms[0].north = rooms[1]
+        rooms[1].east = rooms[2]
+        rooms[0].vault = rooms[2]
+        rooms[0].north = rooms[1]  # repeated set
+        return [room_state(r) for r in rooms]
+
+    first = play()
+    second = play()
+    assert first == second
+
+
+def test_room_multi_round_connections():
+    """Connections stay consistent across many consecutive rounds."""
+    rooms = make_rooms("R0", "R1", "R2", "R3")
+    for _ in range(3):
+        rooms[0].north = rooms[1]
+        rooms[1].east = rooms[2]
+        rooms[2].west_link_room = rooms[3]  # plain attribute, not a link
+        assert rooms[0].exits() == ["north"]
+        assert rooms[1].exits() == ["east", "south"]
+        assert rooms[2].exits() == ["west"]
+        assert rooms[3].exits() == []
+        assert rooms[2].west_link_room is rooms[3]
+
+
+def test_room_state_does_not_grow_unboundedly():
+    """Repeated attribute sets must not grow state, caches or counters."""
+    hall, cellar = make_rooms("Hall", "Cellar")
+    for _ in range(1000):
+        hall.treasure_room = cellar
+        hall.north = cellar
+    assert len(vars(hall)) == 3  # description, treasure_room, north
+    assert len(vars(cellar)) == 2  # description, south
+    assert hall.exits() == ["north"]
+    assert len(Room._directions) == 4  # only the built-in directions
+
+
+def test_room_navigation_unaffected_by_plain_attributes():
+    """Plain room attributes do not appear in or affect navigation."""
+    hall, cellar, attic = make_rooms("Hall", "Cellar", "Attic")
+    hall.north = cellar
+    hall.treasure_room = attic
+    hall.monster_home = attic
+    assert hall.exits() == ["north"]
+    assert hall.exit("north") is cellar
+    assert attic.exits() == []
+    assert cellar.south is hall
+
+
+def test_room_invalid_direction_exception_still_available():
+    """The InvalidDirection exception remains part of the public contract."""
+    assert issubclass(adventurelib.InvalidDirection, Exception)
+
+
+def test_room_deepcopy_snapshot_after_failed_then_successful_calls():
+    """Deep-copied snapshots match before failure and after later success."""
+    hall, cellar = make_rooms("Hall", "Cellar")
+    before = copy.deepcopy(room_state(hall))
+    directions_before = copy.deepcopy(Room._directions)
+    with pytest.raises(KeyError):
+        hall.exit("nowhere")
+    with pytest.raises(InvalidCommand):
+        Room.add_direction("UP", "down")
+    assert room_state(hall) == before
+    assert Room._directions == directions_before
+    # A success right after the failures is unaffected.
+    hall.north = cellar
+    assert hall.exit("north") is cellar
+    assert cellar.exit("south") is hall

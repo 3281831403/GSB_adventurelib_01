@@ -133,7 +133,13 @@ class Placeholder:
 
 
 class Room:
-    """A generic room object that can be used by game code."""
+    """A generic room object that can be used by game code.
+
+    Assigning another Room to an attribute named after a declared direction
+    (see ``add_direction()``) creates a bidirectional navigation connection.
+    Assigning a Room to any other attribute stores it as a plain attribute
+    without creating any connection.
+    """
 
     _directions = {}
 
@@ -184,16 +190,17 @@ class Room:
         return sorted(d for d in self._directions if getattr(self, d))
 
     def __setattr__(self, name, value):
-        if isinstance(value, Room):
-            if name not in self._directions:
-                raise InvalidDirection(
-                    '%r is not a direction you have declared.\n\n' +
-                    'Try calling Room.add_direction(%r, <opposite>) ' % name +
-                    ' where <opposite> is the return direction.'
-                )
+        if isinstance(value, Room) and name in self._directions:
             reverse = self._directions[name]
+            previous = getattr(self, name, None)
             object.__setattr__(self, name, value)
-            object.__setattr__(value, reverse, self)
+            try:
+                object.__setattr__(value, reverse, self)
+            except Exception:
+                # Roll back the forward link so a failed connection leaves
+                # both rooms exactly as they were before the call.
+                object.__setattr__(self, name, previous)
+                raise
         else:
             object.__setattr__(self, name, value)
 
