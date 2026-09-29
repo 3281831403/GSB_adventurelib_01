@@ -1,0 +1,23 @@
+# Config file for automatic testing at travis-ci.org
+
+language: python
+python:
+  - 3.6
+  - 3.5
+  - 3.4
+
+install:
+  - pip install pytest
+
+# Run pytest under each interpreter
+script:
+  - py.test
+
+
+# Add a job to run flake8
+jobs:
+  include:
+    - env: NAME=flake8
+      python: 3.6
+      install: pip install flake8
+      script: flake8 adventurelib.py test_adventurelib.py
