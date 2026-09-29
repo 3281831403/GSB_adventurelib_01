@@ -265,8 +265,10 @@ class Bag(set):
         self._alias_dict.clear()
 
     def copy(self):
-        result = super().copy()
-        result._alias_dict = self._alias_dict.copy()
+        # Rebuild through the constructor so the alias dict is a private
+        # copy: sharing the inner alias sets between bags would let one
+        # bag corrupt the other's lookup state.
+        result = type(self)(self)
         return result
 
     def difference(self, other_bag):
@@ -319,16 +321,33 @@ class Bag(set):
     # Bag interface.
     ####### 
     def find(self, name):
-        """Find an object in the bag by name, but do not remove it.
+        """Find an object in the bag by name or by Item, but do not remove it.
 
-        Return None if the name does not match.
-        
-        If more than one object with the same name exists, returns one of them.
+        ``name`` may be a string, matched case-insensitively against item
+        names and aliases, or an Item instance, matched by identity.
+
+        Return None if there is no match.
+
+        If more than one object with the same name exists, returns one of
+        them, chosen deterministically so the result does not depend on
+        set iteration order.
 
         """
-        name = name.lower()
-        for element in self._alias_dict.get(name, []):
-            return element
+        if isinstance(name, Item):
+            if name in self:
+                return name
+            return None
+        if not isinstance(name, str):
+            raise TypeError(
+                'find() argument must be a str or Item, not %s'
+                % type(name).__name__
+            )
+        matches = self._alias_dict.get(name.lower())
+        if not matches:
+            return None
+        # Sort candidates so the choice is deterministic and does not
+        # depend on set iteration (hash) order.
+        return min(matches, key=lambda item: (item.name, item.aliases))
 
     def __contains__(self, v):
         """Return True if an Item is present in the bag.
@@ -344,6 +363,8 @@ class Bag(set):
 
     def take(self, name):
         """Remove an Item from the bag if it is present.
+
+        ``name`` may be a string name/alias or an Item instance.
 
         If multiple names match, then return one of them.
 

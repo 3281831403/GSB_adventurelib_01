@@ -328,6 +328,274 @@ def test_bag_find():
     assert not bag.find("other")
 
 
+def _bag_snapshot(bag):
+    """Take a deep-copy snapshot of a bag's externally visible state."""
+    return copy.deepcopy(
+        {
+            "items": sorted(item.aliases for item in bag),
+            "alias_map": {
+                alias: sorted(item.aliases for item in items)
+                for alias, items in bag._alias_dict.items()
+            },
+        }
+    )
+
+
+def test_bag_find_by_item_object():
+    """find() accepts an Item and matches it by identity."""
+    lamp = Item("brass lamp", "lamp")
+    key = Item("rusty key", "key")
+    bag = Bag({lamp, key})
+
+    assert bag.find(lamp) is lamp
+    assert bag.find(key) is key
+    # find() must not remove anything
+    assert _bag_snapshot(bag) == _bag_snapshot(Bag({lamp, key}))
+
+
+def test_bag_find_by_item_object_not_present():
+    """find() with an Item that is not in the bag returns None."""
+    bag = Bag({Item("lamp")})
+    before = _bag_snapshot(bag)
+
+    assert bag.find(Item("lamp")) is None
+    assert _bag_snapshot(bag) == before
+
+
+def test_bag_take_by_item_object():
+    """take() accepts an Item object, removes it and returns it."""
+    lamp = Item("brass lamp", "lamp")
+    key = Item("rusty key", "key")
+    bag = Bag({lamp, key})
+
+    assert bag.take(lamp) is lamp
+    assert lamp not in bag
+    assert "lamp" not in bag
+    assert bag == Bag({key})
+    # The alias dict must not keep entries for removed items.
+    assert set(bag._alias_dict) == {"rusty key", "key"}
+
+
+def test_bag_find_by_name_then_take_by_object():
+    """The reported bug: find by name, then take the found object."""
+    lamp = Item("brass lamp", "lamp")
+    bag = Bag({lamp, Item("rusty key", "key")})
+
+    obj = bag.find("lamp")
+    assert obj is lamp
+    assert bag.take(obj) is lamp
+    assert bag.find("lamp") is None
+
+
+@pytest.mark.parametrize("bad_arg", [None, 42, 3.14, ["lamp"], ("lamp",)])
+def test_bag_find_invalid_type(bad_arg):
+    """find() raises a readable TypeError for non-str, non-Item arguments."""
+    bag = Bag({Item("lamp")})
+    before = _bag_snapshot(bag)
+
+    with pytest.raises(TypeError, match="must be a str or Item"):
+        bag.find(bad_arg)
+    # A rejected call must leave the state field-for-field identical.
+    assert _bag_snapshot(bag) == before
+
+
+@pytest.mark.parametrize("bad_arg", [None, 42, 3.14, ["lamp"], ("lamp",)])
+def test_bag_take_invalid_type(bad_arg):
+    """take() raises a readable TypeError and rolls back fully."""
+    lamp = Item("lamp")
+    bag = Bag({lamp})
+    before = _bag_snapshot(bag)
+
+    with pytest.raises(TypeError, match="must be a str or Item"):
+        bag.take(bad_arg)
+    assert _bag_snapshot(bag) == before
+    # A successful call right after the failure must be unaffected.
+    assert bag.take(lamp) is lamp
+    assert not bag
+
+
+@pytest.mark.parametrize("missing", ["torch", "LAMP ", "", "lamp lamp"])
+def test_bag_take_missing_name_returns_none(missing):
+    """take() with a name that does not match returns None, then succeeds."""
+    lamp = Item("lamp")
+    bag = Bag({lamp})
+    before = _bag_snapshot(bag)
+
+    assert bag.take(missing) is None
+    assert _bag_snapshot(bag) == before
+    # Failure must not break a following successful call.
+    assert bag.take("lamp") is lamp
+    assert not bag
+
+
+def test_bag_find_and_take_empty_bag():
+    """Looking in an empty bag (resource exhaustion) returns None."""
+    bag = Bag()
+
+    assert bag.find("lamp") is None
+    assert bag.find(Item("lamp")) is None
+    assert bag.take("lamp") is None
+    assert bag.take(Item("lamp")) is None
+    assert _bag_snapshot(bag) == {"items": [], "alias_map": {}}
+
+
+def test_bag_take_single_element_boundary():
+    """A single-element bag empties exactly once."""
+    lamp = Item("lamp")
+    bag = Bag({lamp})
+
+    assert bag.take(lamp) is lamp
+    assert not bag
+    assert bag._alias_dict == {}
+    # Repeating the take on the now-empty bag keeps returning None.
+    assert bag.take(lamp) is None
+    assert bag.take("lamp") is None
+
+
+def test_bag_take_repeated_calls_until_empty():
+    """Repeated take() calls drain the bag one item per call."""
+    items = [Item("coin", "coins") for _ in range(3)]
+    bag = Bag(items)
+
+    taken = [bag.take("coin") for _ in range(3)]
+    assert sorted(taken, key=id) == sorted(items, key=id)
+    assert not bag
+    assert bag._alias_dict == {}
+    # Further calls on the exhausted bag return None.
+    assert bag.take("coin") is None
+
+
+def test_bag_find_deterministic_with_shared_alias():
+    """find() picks deterministically among items sharing an alias."""
+    apple = Item("apple", "fruit")
+    banana = Item("banana", "fruit")
+    bag = Bag({banana, apple})
+
+    # Repeated calls on the same bag return the identical object.
+    first = bag.find("fruit")
+    assert first is apple
+    for _ in range(5):
+        assert bag.find("fruit") is first
+
+    # Replaying the same input sequence yields the same result.
+    replay = Bag({Item("apple", "fruit"), Item("banana", "fruit")})
+    assert replay.find("fruit").aliases == first.aliases
+
+    # take() drains the shared alias in the same deterministic order.
+    assert bag.take("fruit") is apple
+    assert bag.take("fruit") is banana
+    assert bag.take("fruit") is None
+
+
+def test_bag_mixed_name_and_object_sequence():
+    """Out-of-order mixes of names and objects behave per round."""
+    lamp = Item("lamp")
+    key = Item("key")
+    coin = Item("coin")
+    bag = Bag({lamp, key, coin})
+
+    # Round 1: partial completion - a failed take between two good ones.
+    assert bag.take("lamp") is lamp
+    assert bag.take("torch") is None
+    assert bag.take(key) is key
+    assert bag == Bag({coin})
+
+    # Round 2: retry after failure works, by object and by name.
+    assert bag.take(coin) is coin
+    assert not bag
+
+    # Round 3: the empty bag stays stable under further calls.
+    before = _bag_snapshot(bag)
+    assert bag.take("coin") is None
+    assert bag.take(lamp) is None
+    assert _bag_snapshot(bag) == before
+
+
+@pytest.mark.parametrize("query", ["lamp", "Lamp", "LAMP", "lAmP"])
+def test_bag_take_by_name_case_insensitive(query):
+    """take() by name is case-insensitive, like find()."""
+    lamp = Item("Brass Lamp", "LAMP")
+    bag = Bag({lamp})
+
+    assert bag.take(query) is lamp
+    assert not bag
+
+
+def test_bag_contains_name_and_object():
+    """The 'in' operator accepts both names and Item objects."""
+    lamp = Item("lamp")
+    bag = Bag({lamp})
+
+    assert lamp in bag
+    assert "lamp" in bag
+    assert "LAMP" in bag
+    assert Item("lamp") not in bag
+    assert "torch" not in bag
+
+
+def test_bag_copy_has_independent_alias_state():
+    """copy() must not share alias sets with the original bag."""
+    shared = Item("apple", "fruit")
+    bag = Bag({shared, Item("banana", "fruit")})
+    before = _bag_snapshot(bag)
+
+    replica = bag.copy()
+    assert _bag_snapshot(replica) == before
+
+    # Mutating the copy must not leak into the original's lookup state.
+    replica.add(Item("cherry", "fruit"))
+    replica.take("banana")
+    assert _bag_snapshot(bag) == before
+    assert bag.find("fruit") in {shared, bag.find("banana")}
+
+    # ... and vice versa.
+    bag.add(Item("date", "fruit"))
+    assert "date" not in replica
+
+
+def test_bag_alias_dict_does_not_grow_unboundedly():
+    """Adding and removing many items leaves no alias state behind."""
+    bag = Bag()
+    items = [Item("item%d" % i) for i in range(100)]
+    for item in items:
+        bag.add(item)
+    assert len(bag._alias_dict) == 100
+
+    for item in items:
+        assert bag.take(item) is item
+    assert not bag
+    assert bag._alias_dict == {}
+
+
+def test_command_flow_find_then_take():
+    """The command flow works when a handler finds by name, takes by object."""
+    room_items = Bag({Item("brass lamp", "lamp"), Item("rusty key", "key")})
+    inventory = Bag()
+
+    @when("take ITEM")
+    def take(item):
+        obj = room_items.find(item)
+        if obj is None:
+            say("There is no %s here." % item)
+            return
+        inventory.add(room_items.take(obj))
+
+    # Round 1: take by name via the command dispatcher.
+    _handle_command("take lamp")
+    assert "brass lamp" in inventory
+    assert "lamp" not in room_items
+
+    # Round 2: a failed take prints a message and corrupts nothing.
+    before = _bag_snapshot(room_items)
+    _handle_command("take chandelier")
+    assert _bag_snapshot(room_items) == before
+
+    # Round 3: the failure did not break the following successful take.
+    _handle_command("take key")
+    assert "rusty key" in inventory
+    assert not room_items
+
+
 @pytest.mark.parametrize("current_context", ["foo", "foo.bar", "foo.bar.baz"])
 def test_match_context(current_context):
     """We can match contexts."""
