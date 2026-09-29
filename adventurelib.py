@@ -388,7 +388,8 @@ def _register(command, func, context=None, kwargs=None):
     sig = inspect.signature(func)
     func_argnames = set(sig.parameters)
     when_argnames = set(pattern.argnames) | set(kwargs.keys())
-    if func_argnames != when_argnames:
+    if func_argnames != when_argnames and not _signature_compatible(
+            sig, when_argnames):
         raise InvalidCommand(
             'The function %s%s has the wrong signature for @when(%r)' % (
                 func.__name__, sig, command
@@ -398,6 +399,22 @@ def _register(command, func, context=None, kwargs=None):
         )
 
     commands.append((pattern, func, kwargs))
+
+
+def _signature_compatible(sig, argnames):
+    """Return True if a function may be called with the given argument names.
+
+    This allows command functions to be wrapped by decorators that accept
+    arbitrary arguments (e.g. ``def wrapper(*args, **kwargs)``), as long as
+    the captured command arguments can still be bound to the wrapped
+    signature.
+
+    """
+    try:
+        sig.bind(**{name: None for name in argnames})
+    except TypeError:
+        return False
+    return True
 
 
 class Pattern:

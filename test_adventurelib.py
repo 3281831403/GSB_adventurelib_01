@@ -1,4 +1,5 @@
 import copy
+import functools
 from contextlib import contextmanager, redirect_stdout
 from io import StringIO
 from unittest.mock import patch
@@ -427,3 +428,281 @@ def test_room_add_direction_is_attribute():
         match="'exit' is an existing attribute and cannot be used as direction name!",
     ):
         room.add_direction("up", "exit")
+
+
+def passthrough_decorator(func):
+    """A decorator that accepts arbitrary args, without functools.wraps."""
+
+    def wrapper(*args, **kwargs):
+        return func(*args, **kwargs)
+
+    return wrapper
+
+
+def _commands_state():
+    """Extract a comparable, deep-copyable snapshot of registered commands."""
+    return copy.deepcopy(
+        [
+            (p.orig_pattern, p.pattern_context, list(p.argnames), func, dict(kw))
+            for p, func, kw in adventurelib.commands
+        ]
+    )
+
+
+def _run_command(cmd):
+    """Handle a command, swallowing the printed output."""
+    with redirect_stdout(StringIO()):
+        _handle_command(cmd)
+
+
+def test_register_wrapped_command():
+    """A command wrapped by a *args/**kwargs decorator still registers."""
+    called = []
+
+    @when("look")
+    @passthrough_decorator
+    def look():
+        called.append("look")
+
+    _run_command("look")
+    assert called == ["look"]
+
+
+@pytest.mark.parametrize(
+    "typed,expected",
+    [
+        ("take apple", "apple"),
+        ("take golden apple", "golden apple"),
+        ("take the one ring", "the one ring"),
+    ],
+)
+def test_register_wrapped_command_args(typed, expected):
+    """Captured placeholder args pass through the wrapper unchanged."""
+    got = []
+
+    @when("take ITEM")
+    @passthrough_decorator
+    def take(item):
+        got.append(item)
+
+    _run_command(typed)
+    assert got == [expected]
+
+
+def test_register_wrapped_command_with_kwargs():
+    """Fixed keyword args pass through the wrapper alongside captures."""
+    got = []
+
+    @when("hit TARGET with WEAPON", verb="hit")
+    @passthrough_decorator
+    def hit(target, weapon, verb):
+        got.append((target, weapon, verb))
+
+    _run_command("hit dragon with glass sword")
+    assert got == [("dragon", "glass sword", "hit")]
+
+
+def test_register_wrapped_command_functools_wraps():
+    """A decorator using functools.wraps registers and dispatches."""
+    calls = []
+
+    def tracing(func):
+        @functools.wraps(func)
+        def inner(*args, **kwargs):
+            calls.append("traced")
+            return func(*args, **kwargs)
+
+        return inner
+
+    @when("wave")
+    @tracing
+    def wave():
+        calls.append("waved")
+
+    _run_command("wave")
+    assert calls == ["traced", "waved"]
+
+
+def test_register_decorator_order_when_innermost():
+    """@when applied under a decorator registers the original function."""
+    calls = []
+
+    def tracing(func):
+        @functools.wraps(func)
+        def inner(*args, **kwargs):
+            calls.append("traced")
+            return func(*args, **kwargs)
+
+        return inner
+
+    @tracing
+    @when("jump")
+    def jump():
+        calls.append("jumped")
+
+    _run_command("jump")
+    assert calls == ["jumped"]
+
+
+@pytest.mark.parametrize(
+    "func",
+    [
+        lambda: None,  # missing the captured argument
+        lambda wrong: None,  # wrong argument name
+        lambda item, extra: None,  # extra argument without a default
+        lambda *args: None,  # cannot accept the captured keyword argument
+    ],
+    ids=["missing-arg", "wrong-name", "extra-required", "varargs-only"],
+)
+def test_register_incompatible_signature_rejected(func):
+    """Signatures that cannot bind the captured args are still rejected."""
+    before = _commands_state()
+    with pytest.raises(InvalidCommand):
+        when("take ITEM")(func)
+    assert _commands_state() == before
+
+
+@pytest.mark.parametrize(
+    "func",
+    [
+        lambda item, extra=None: None,  # extra argument with a default
+        lambda *args, **kwargs: None,  # generic wrapper signature
+        lambda **kwargs: None,  # keyword-only catch-all
+    ],
+    ids=["extra-default", "args-kwargs", "kwargs-only"],
+)
+def test_register_compatible_signature_accepted(func):
+    """Signatures that can bind the captured args register successfully."""
+    before = _commands_state()
+    when("take ITEM")(func)
+    after = _commands_state()
+    assert len(after) == len(before) + 1
+    assert after[:-1] == before
+
+
+def test_register_failure_then_success():
+    """A rejected registration leaves later registrations unaffected."""
+    before = _commands_state()
+    with pytest.raises(InvalidCommand):
+        when("take ITEM")(lambda wrong: None)
+    assert _commands_state() == before
+
+    got = []
+
+    @when("take ITEM")
+    @passthrough_decorator
+    def take(item):
+        got.append(item)
+
+    _run_command("take apple")
+    assert got == ["apple"]
+
+
+def test_wrapped_command_multiple_rounds():
+    """A wrapped command can be dispatched repeatedly and deterministically."""
+    got = []
+
+    @when("take ITEM")
+    @passthrough_decorator
+    def take(item):
+        got.append(item)
+
+    for _ in range(3):
+        _run_command("take apple")
+        _run_command("take golden apple")
+    assert got == ["apple", "golden apple"] * 3
+
+
+def test_wrapped_command_replay_deterministic():
+    """The same input sequence produces the same results when replayed."""
+
+    def play():
+        got = []
+
+        @when("take ITEM")
+        @passthrough_decorator
+        def take(item):
+            got.append(item)
+
+        for typed in ["take apple", "take golden apple", "take apple"]:
+            _run_command(typed)
+        adventurelib.commands.pop()
+        return got
+
+    first = play()
+    second = play()
+    assert first == second == ["apple", "golden apple", "apple"]
+
+
+def test_wrapped_commands_out_of_order_registration():
+    """Dispatch results do not depend on command registration order."""
+
+    def play(order):
+        got = []
+
+        def make_take():
+            @when("take ITEM")
+            @passthrough_decorator
+            def take(item):
+                got.append(("take", item))
+
+        def make_drop():
+            @when("drop ITEM")
+            @passthrough_decorator
+            def drop(item):
+                got.append(("drop", item))
+
+        makers = {"take": make_take, "drop": make_drop}
+        for name in order:
+            makers[name]()
+        _run_command("take apple")
+        _run_command("drop apple")
+        adventurelib.commands.pop()
+        adventurelib.commands.pop()
+        return got
+
+    assert play(["take", "drop"]) == play(["drop", "take"]) == [
+        ("take", "apple"),
+        ("drop", "apple"),
+    ]
+
+
+def test_wrapped_command_partial_match_unknown():
+    """Unknown input still falls through after a wrapped command matches."""
+    got = []
+
+    @when("take ITEM")
+    @passthrough_decorator
+    def take(item):
+        got.append(item)
+
+    buf = StringIO()
+    with redirect_stdout(buf):
+        _handle_command("take apple")
+        _handle_command("frobnicate apple")
+        _handle_command("take")
+    out = buf.getvalue()
+    assert got == ["apple"]
+    assert "I don't understand 'frobnicate apple'." in out
+    assert "I don't understand 'take'." in out
+
+
+def test_wrapped_command_with_context():
+    """Wrapped commands respect contexts like unwrapped commands."""
+    got = []
+
+    @when("look", context="confused")
+    @passthrough_decorator
+    def look_confused():
+        got.append("confused")
+
+    @when("look")
+    @passthrough_decorator
+    def look():
+        got.append("normal")
+
+    _run_command("look")
+    with active_context("confused"):
+        _run_command("look")
+    _run_command("look")
+    assert got == ["normal", "confused", "normal"]
